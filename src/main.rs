@@ -97,6 +97,7 @@ fn main() {
             }
         }
     }
+    pool.join();
 }
 
 fn check_ssh_login(ip: String, port: u16, credentials: Vec<(String, String)>, output_file: &str) {
