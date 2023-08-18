@@ -185,6 +185,6 @@ fn write_successful_login_to_file(output_file: &str, ip: &str, username: &str, p
         .unwrap();
     let mut file = BufWriter::new(file);
     
-    writeln!(file, "IP: {}, Username: {}, Password: {}", ip, username, password).unwrap();
+    writeln!(file, "{}:{}@{}", username, password, ip).unwrap();
     file.flush().unwrap();
 }
