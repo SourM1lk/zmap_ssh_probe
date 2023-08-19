@@ -21,9 +21,7 @@ Inspired by [Zmap-ProxyScanner](https://github.com/Yariya/Zmap-ProxyScanner).
 Before you begin, ensure you have met the following requirements:
 
 - Rust installed on your machine.
-- SSH library dependencies.
 - Zmap installed (for IP scanning integration).
-- (any other dependencies)
 
 ## Installation
 
