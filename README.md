@@ -29,29 +29,29 @@ Before you begin, ensure you have met the following requirements:
 
 1. Clone the repository:
 
-\```bash
+```bash
 git clone https://github.com/your_username/ssh-scanner.git
-\```
+```
 
 2. Navigate to the project directory:
 
-\```bash
+```bash
 cd ssh-scanner
-\```
+```
 
 3. Build the project:
 
-\```bash
+```bash
 cargo build --release
-\```
+```
 
 ## Usage
 
 To use SSH Scanner with Zmap:
 
-\```bash
+```bash
 zmap -p 22 | ./target/release/ssh-scanner [OPTIONS]
-\```
+```
 
 Options:
 
@@ -62,9 +62,9 @@ Options:
 
 Example:
 
-\```bash
+```bash
 zmap -p 22 | ./target/release/ssh-scanner -c credentials.txt
-\```
+```
 
 ## Contributing
 
