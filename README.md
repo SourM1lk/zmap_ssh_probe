@@ -68,12 +68,6 @@ zmap -p 22 | ./target/release/zmap_ssh_probe -p 22 -o TestResults.txt -t 500
 
 ```
 
-## Contributing
-
-Pull requests are welcome. For major changes, please open an issue first to discuss what you would like to change.
-
-Please make sure to update tests as appropriate.
-
 ## Disclaimer
 ```
 This software is provided "as is" without warranty of any kind, either expressed or implied, including, but not limited to, the implied warranties of merchantability and fitness for a particular purpose. The entire risk as to the quality and performance of the software is with the user.
