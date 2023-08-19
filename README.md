@@ -64,7 +64,7 @@ Example:
 
 ```bash
 # Warning: This zmap command scans the internet. Ensure your ZMAP command targets only authorized IPs.
-zmap -p 22 | ./target/release/ssh-scanner -p 22 -o TestResults.txt -t 500
+zmap -p 22 | ./target/release/zmap_ssh_probe -p 22 -o TestResults.txt -t 500
 
 ```
 
