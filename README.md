@@ -30,13 +30,13 @@ Before you begin, ensure you have met the following requirements:
 1. Clone the repository:
 
 ```bash
-git clone https://github.com/your_username/ssh-scanner.git
+git clone https://github.com/SourM1lk/zmap_ssh_probe.git
 ```
 
 2. Navigate to the project directory:
 
 ```bash
-cd ssh-scanner
+cd zmap_ssh_probe
 ```
 
 3. Build the project:
@@ -50,20 +50,19 @@ cargo build --release
 To use SSH Scanner with Zmap:
 
 ```bash
-zmap -p 22 | ./target/release/ssh-scanner [OPTIONS]
+zmap -p 22 | ./target/release/zmap_ssh_probe [OPTIONS]
 ```
 
 Options:
-
-- `-i, --ip <IP>`: Specify the IP or IP range (can be piped from Zmap).
-- `-p, --port <PORT>`: Set the SSH port (default: 22).
-- `-c, --credentials <FILE>`: Provide a file with a list of username-password pairs.
-- (any other options)
+- `-p, --port <PORT>`: Specify the SSH port to target. Default is `22`.
+- `-o, --output_file <FILENAME>`: Name of the file to which successful logins will be written. Default is `results.txt`.
+- `-t, --threads <THREAD_COUNT>`: Number of threads to use for scanning. Default is `50`.
 
 Example:
 
 ```bash
-zmap -p 22 | ./target/release/ssh-scanner -c credentials.txt
+zmap -p 22 | ./target/release/ssh-scanner -p 22 -o TestResults.txt -t 500
+
 ```
 
 ## Contributing
