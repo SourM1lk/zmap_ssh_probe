@@ -43,6 +43,9 @@ cd zmap_ssh_probe
 cargo build --release
 ```
 
+****Note**: Ensure that the `credentials.txt` file is in the same directory as the executable before running the scanner.
+**
+
 ## Usage
 
 To use SSH Scanner with Zmap:
