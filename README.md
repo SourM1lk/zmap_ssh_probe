@@ -81,16 +81,6 @@ In no event will the authors or copyright holders be liable for any damages, inc
 This software is intended for educational and research purposes only. The authors do not encourage or condone the use of this software for malicious activities or any actions that violate the law. It is the responsibility of the user to ensure that their use of this software complies with all applicable laws and regulations. The authors will not be held responsible for any misuse of the software.
 ```
 
-/*
- * ----------------------------------------------------------------------------
- * "THE BEER-WARE LICENSE" (Revision 42):
- * SourMilk wrote this file. As long as you retain this notice you
- * can do whatever you want with this stuff. If we meet some day, and you think
- * this stuff is worth it, you can buy me a beer in return. - Sour
- * ----------------------------------------------------------------------------
- */
-
-
 ## License
 
 [![Beerware License](https://img.shields.io/badge/License-Beerware-yellow.svg)](https://en.wikipedia.org/wiki/Beerware)
