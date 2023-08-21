@@ -56,7 +56,6 @@ fn main() {
             let failed_count = FAILED.load(Ordering::Relaxed);
             let timeouts_count = TIMEOUTS.load(Ordering::Relaxed);
 
-            // Clear current line and print updated stats on one line
             print!("IPs Imported: {} | IPs Checked: {} | Combos Checked: {} | Successful: {} | Failed: {} | Timeouts: {} \n", 
                 imported_count.to_string().blue(),
                 checked_count.to_string().blue(),
