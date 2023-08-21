@@ -7,6 +7,5 @@ edition = "2021"
 
 [dependencies]
 ssh2 = "0.9"
-threadpool = "1.0"
 colored = "2"
 clap = { version = "4.3.22", features = ["derive"] }
