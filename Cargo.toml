@@ -3,9 +3,23 @@ name = "zmap_ssh_probe"
 version = "0.1.0"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
-ssh2 = "0.9"
 colored = "2"
 clap = { version = "4.3.22", features = ["derive"] }
+async-ssh2-tokio = "0.7.0"
+tokio = { version = "1.32.0", features = ["full"] }
+futures = "0.3.28"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = 'abort'
+opt-level = "z"
+strip = true
+
+[package.metadata.authors]
+name = "SourM1lk"
+email = "sourm1lk@sour.m1lk"
+
+[package.metadata.description]
+summary = "A simple zmap probe for ssh servers"

@@ -58,13 +58,14 @@ zmap -p 22 | ./target/release/zmap_ssh_probe [OPTIONS]
 Options:
 - `-p, --port <PORT>`: Specify the SSH port to target. Default is `22`.
 - `-o, --output_file <FILENAME>`: Name of the file to which successful logins will be written. Default is `results.txt`.
-- `-t, --threads <THREAD_COUNT>`: Number of threads to use for scanning. Default is `50`.
+- `-w, --workers <WORKER_COUNT>`: Number of workers to use for scanning. Default is `1000`.
 
 Example:
-
+****Note**: The scanner currently spawns 10 threads. FI you want to change this find `#[tokio::main(flavor = "multi_thread", worker_threads = 10)]` and change to the ammount of threads you want. This also splits your workers. Example 1000 workers across 10 threads equals 100 workers per thread.
+**
 ```bash
 # Warning: This zmap command scans the internet. Ensure your ZMAP command targets only authorized IPs.
-zmap -p 22 | ./target/release/zmap_ssh_probe -p 22 -o TestResults.txt -t 500
+zmap -p 22 | ./target/release/zmap_ssh_probe -p 22 -o TestResults.txt -w 500
 
 ```
 
