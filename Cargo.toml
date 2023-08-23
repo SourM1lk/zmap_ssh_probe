@@ -13,7 +13,6 @@ futures = "0.3.28"
 [profile.release]
 lto = true
 codegen-units = 1
-panic = 'abort'
 opt-level = "z"
 strip = true
 
